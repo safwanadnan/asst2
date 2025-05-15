@@ -1,4 +1,5 @@
 #include "tasksys.h"
+#include <thread>
 
 
 IRunnable::~IRunnable() {}
@@ -49,27 +50,42 @@ const char* TaskSystemParallelSpawn::name() {
 }
 
 TaskSystemParallelSpawn::TaskSystemParallelSpawn(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    this->num_threads = num_threads;
 }
 
 TaskSystemParallelSpawn::~TaskSystemParallelSpawn() {}
 
 void TaskSystemParallelSpawn::run(IRunnable* runnable, int num_total_tasks) {
-
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Part A.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    // Create worker threads
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+    
+    // Worker function for each thread
+    auto worker_function = [runnable, num_total_tasks](int start_task, int end_task) {
+        for (int i = start_task; i < end_task; i++) {
+            runnable->runTask(i, num_total_tasks);
+        }
+    };
+    
+    // Calculate tasks per thread
+    int tasks_per_thread = (num_total_tasks + num_threads - 1) / num_threads;
+    
+    // Launch worker threads
+    for (int i = 0; i < num_threads; i++) {
+        int start_task = i * tasks_per_thread;
+        int end_task = std::min((i + 1) * tasks_per_thread, num_total_tasks);
+        
+        // Don't create empty threads
+        if (start_task >= num_total_tasks) {
+            break;
+        }
+        
+        workers.push_back(std::thread(worker_function, start_task, end_task));
+    }
+    
+    // Join all worker threads
+    for (auto& worker : workers) {
+        worker.join();
     }
 }
 
@@ -95,27 +111,85 @@ const char* TaskSystemParallelThreadPoolSpinning::name() {
 }
 
 TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    this->num_threads = num_threads;
+    should_terminate = false;
+    
+    // Create the thread pool
+    for (int i = 0; i < num_threads; i++) {
+        thread_pool.push_back(std::thread([this]() {
+            while (true) {
+                // Check for termination
+                if (should_terminate) {
+                    break;
+                }
+                
+                // Try to get a task from the queue
+                IRunnable* runnable = nullptr;
+                int task_id = -1;
+                int num_total_tasks = 0;
+                
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    if (!task_queue.empty()) {
+                        auto task = task_queue.front();
+                        task_queue.pop();
+                        
+                        runnable = std::get<0>(task);
+                        task_id = std::get<1>(task);
+                        num_total_tasks = std::get<2>(task);
+                    }
+                }
+                
+                // If we got a task, execute it
+                if (runnable != nullptr) {
+                    runnable->runTask(task_id, num_total_tasks);
+                    
+                    // Decrement tasks remaining
+                    tasks_remaining--;
+                }
+                
+                // Otherwise continue spinning
+            }
+        }));
+    }
 }
 
-TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {}
+TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
+    // Signal threads to terminate
+    should_terminate = true;
+    
+    // Wake up any threads waiting on the queue
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        // Clear any remaining tasks
+        while (!task_queue.empty()) {
+            task_queue.pop();
+        }
+    }
+    
+    // Join all threads
+    for (auto& thread : thread_pool) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+}
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
-
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Part A.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    // Reset tasks counter
+    tasks_remaining = num_total_tasks;
+    
+    // Add tasks to the queue
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        for (int i = 0; i < num_total_tasks; i++) {
+            task_queue.push(std::make_tuple(runnable, i, num_total_tasks));
+        }
+    }
+    
+    // Wait for all tasks to complete (spin waiting)
+    while (tasks_remaining > 0) {
+        // Just spin
     }
 }
 
@@ -141,34 +215,104 @@ const char* TaskSystemParallelThreadPoolSleeping::name() {
 }
 
 TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int num_threads): ITaskSystem(num_threads) {
-    //
-    // TODO: CS149 student implementations may decide to perform setup
-    // operations (such as thread pool construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    this->num_threads = num_threads;
+    should_terminate = false;
+    tasks_remaining = 0;
+    
+    // Create the thread pool
+    for (int i = 0; i < num_threads; i++) {
+        thread_pool.push_back(std::thread([this]() {
+            while (true) {
+                IRunnable* runnable = nullptr;
+                int task_id = -1;
+                int num_total_tasks = 0;
+                
+                // Get a task from the queue or wait if none available
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    
+                    // Wait until there's a task or the system is terminating
+                    cv_tasks_available.wait(lock, [this]() {
+                        return !task_queue.empty() || should_terminate;
+                    });
+                    
+                    // If we're terminating, exit the thread
+                    if (should_terminate) {
+                        break;
+                    }
+                    
+                    // Get the task
+                    if (!task_queue.empty()) {
+                        auto task = task_queue.front();
+                        task_queue.pop();
+                        
+                        runnable = std::get<0>(task);
+                        task_id = std::get<1>(task);
+                        num_total_tasks = std::get<2>(task);
+                    }
+                }
+                
+                // Execute the task outside the lock
+                if (runnable != nullptr) {
+                    runnable->runTask(task_id, num_total_tasks);
+                    
+                    // Decrement tasks remaining count
+                    int remaining = --tasks_remaining;
+                    
+                    // If this was the last task, notify the waiting thread
+                    if (remaining == 0) {
+                        cv_tasks_done.notify_all();
+                    }
+                }
+            }
+        }));
+    }
 }
 
 TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
-    //
-    // TODO: CS149 student implementations may decide to perform cleanup
-    // operations (such as thread pool shutdown construction) here.
-    // Implementations are free to add new class member variables
-    // (requiring changes to tasksys.h).
-    //
+    // Signal threads to terminate
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        should_terminate = true;
+    }
+    
+    // Notify all waiting threads to check termination flag
+    cv_tasks_available.notify_all();
+    
+    // Join all threads
+    for (auto& thread : thread_pool) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
 }
 
 void TaskSystemParallelThreadPoolSleeping::run(IRunnable* runnable, int num_total_tasks) {
-
-
-    //
-    // TODO: CS149 students will modify the implementation of this
-    // method in Parts A and B.  The implementation provided below runs all
-    // tasks sequentially on the calling thread.
-    //
-
-    for (int i = 0; i < num_total_tasks; i++) {
-        runnable->runTask(i, num_total_tasks);
+    // No tasks to run
+    if (num_total_tasks == 0) {
+        return;
+    }
+    
+    // Set the tasks remaining counter
+    tasks_remaining = num_total_tasks;
+    
+    // Add all tasks to the queue
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        for (int i = 0; i < num_total_tasks; i++) {
+            task_queue.push(std::make_tuple(runnable, i, num_total_tasks));
+        }
+    }
+    
+    // Wake up worker threads
+    cv_tasks_available.notify_all();
+    
+    // Wait for tasks to complete
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        cv_tasks_done.wait(lock, [this]() {
+            return tasks_remaining == 0;
+        });
     }
 }
 

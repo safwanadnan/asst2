@@ -61,56 +61,63 @@ typedef struct {
  * Implement your task here
 */
 class YourTask : public IRunnable {
+    private:
+        std::vector<int>* results;
+        int mul_factor;
+        
     public:
-        YourTask() {}
+        YourTask(std::vector<int>* results_array, int multiplier) : 
+            results(results_array), mul_factor(multiplier) {}
+        
         ~YourTask() {}
-        void runTask(int task_id, int num_total_tasks) {}
+        
+        void runTask(int task_id, int num_total_tasks) {
+            // Each task writes to its own index in the results array
+            (*results)[task_id] = task_id * mul_factor;
+            
+            // Add a small delay to better simulate real work
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
 };
 /*
  * Implement your test here. Call this function from a wrapper that passes in
  * do_async and num_elements. See `simpleTest`, `simpleTestSync`, and
  * `simpleTestAsync` as an example.
  */
-TestResults yourTest(ITaskSystem* t, bool do_async, int num_elements, int num_bulk_task_launches) {
-    // TODO: initialize your input and output buffers
-    int* output = new int[num_elements];
-
-    // TODO: instantiate your bulk task launches
-
+TestResults yourCustomTest(ITaskSystem* t, bool do_async) {
+    // Create a large number of tasks to test the task system
+    int num_tasks = 1000;
+    std::vector<int> results(num_tasks, 0);
+    int multiplier = 5;
+    
+    YourTask task(&results, multiplier);
+    
     // Run the test
     double start_time = CycleTimer::currentSeconds();
     if (do_async) {
-        // TODO:
-        // initialize dependency vector
-        // make calls to t->runAsyncWithDeps and push TaskID to dependency vector
-        // t->sync() at end
+        std::vector<TaskID> deps;
+        TaskID task_id = t->runAsyncWithDeps(&task, num_tasks, deps);
+        t->sync();
     } else {
-        // TODO: make calls to t->run
+        t->run(&task, num_tasks);
     }
     double end_time = CycleTimer::currentSeconds();
-
-    // Correctness validation
-    TestResults results;
-    results.passed = true;
-
-    for (int i=0; i<num_elements; i++) {
-        int value = 0; // TODO: initialize value
-        for (int j=0; j<num_bulk_task_launches; j++) {
-            // TODO: update value as expected
-        }
-
-        int expected = value;
-        if (output[i] != expected) {
-            results.passed = false;
-            printf("%d: %d expected=%d\n", i, output[i], expected);
+    
+    // Verify results
+    TestResults test_results;
+    test_results.passed = true;
+    
+    for (int i = 0; i < num_tasks; i++) {
+        if (results[i] != i * multiplier) {
+            test_results.passed = false;
+            printf("Error: Task %d produced incorrect result: %d (expected %d)\n", 
+                  i, results[i], i * multiplier);
             break;
         }
     }
-    results.time = end_time - start_time;
-
-    delete [] output;
-
-    return results;
+    
+    test_results.time = end_time - start_time;
+    return test_results;
 }
 
 /*

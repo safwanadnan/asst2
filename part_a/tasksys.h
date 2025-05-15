@@ -2,6 +2,12 @@
 #define _TASKSYS_H
 
 #include "itasksys.h"
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+#include <queue>
+#include <atomic>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -26,6 +32,9 @@ class TaskSystemSerial: public ITaskSystem {
  * of the ITaskSystem interface.
  */
 class TaskSystemParallelSpawn: public ITaskSystem {
+    private:
+        int num_threads;
+        
     public:
         TaskSystemParallelSpawn(int num_threads);
         ~TaskSystemParallelSpawn();
@@ -43,6 +52,19 @@ class TaskSystemParallelSpawn: public ITaskSystem {
  * documentation of the ITaskSystem interface.
  */
 class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
+    private:
+        int num_threads;
+        std::vector<std::thread> thread_pool;
+        
+        std::mutex queue_mutex;
+        bool should_terminate;
+        
+        // Task queue: <runnable, task_id, num_total_tasks>
+        std::queue<std::tuple<IRunnable*, int, int>> task_queue;
+        
+        // For tracking tasks completion
+        std::atomic<int> tasks_remaining;
+        
     public:
         TaskSystemParallelThreadPoolSpinning(int num_threads);
         ~TaskSystemParallelThreadPoolSpinning();
@@ -60,6 +82,21 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
  * itasksys.h for documentation of the ITaskSystem interface.
  */
 class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
+    private:
+        int num_threads;
+        std::vector<std::thread> thread_pool;
+        
+        std::mutex queue_mutex;
+        std::condition_variable cv_tasks_available;
+        std::condition_variable cv_tasks_done;
+        bool should_terminate;
+        
+        // Task queue: <runnable, task_id, num_total_tasks>
+        std::queue<std::tuple<IRunnable*, int, int>> task_queue;
+        
+        // For tracking tasks completion
+        std::atomic<int> tasks_remaining;
+        
     public:
         TaskSystemParallelThreadPoolSleeping(int num_threads);
         ~TaskSystemParallelThreadPoolSleeping();
