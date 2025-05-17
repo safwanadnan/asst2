@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <deque>
 
 /*
  * TaskSystemSerial: This class is the student's implementation of a
@@ -88,13 +89,13 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
             IRunnable* runnable;
             int num_total_tasks;
             int tasks_remaining;
-            std::set<TaskID> dependent_tasks; // Tasks that depend on this one
+            std::vector<TaskID> dependent_tasks; // Tasks that depend on this one (optimized)
             bool is_complete;
         };
         
-        // Task queue for ready tasks
+        // Task queue for ready tasks - using deque for better cache locality
         // Each entry is (task_id, task_index, total_tasks)
-        std::queue<std::tuple<TaskID, int, int>> ready_queue;
+        std::deque<std::tuple<TaskID, int, int>> ready_queue;
         
         // Map to store task information
         std::unordered_map<TaskID, TaskInfo> task_info;
@@ -110,6 +111,7 @@ class TaskSystemParallelThreadPoolSleeping: public ITaskSystem {
         
         // Helper methods
         void checkAndEnqueueWaitingTasks(TaskID completed_task_id);
+        void bulkEnqueueTasks(TaskID task_id, int num_total_tasks);
         
     public:
         TaskSystemParallelThreadPoolSleeping(int num_threads);

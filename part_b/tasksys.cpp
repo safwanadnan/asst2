@@ -140,6 +140,7 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
                 TaskID task_id = 0;
                 int task_index = -1;
                 int num_total_tasks = 0;
+                IRunnable* task_runnable = nullptr;
                 
                 {
                     std::unique_lock<std::mutex> lock(queue_mutex);
@@ -157,24 +158,28 @@ TaskSystemParallelThreadPoolSleeping::TaskSystemParallelThreadPoolSleeping(int n
                     // Get a task from the ready queue
                     if (!ready_queue.empty()) {
                         auto task = ready_queue.front();
-                        ready_queue.pop();
+                        ready_queue.pop_front(); // Changed from pop() to pop_front() for deque
                         
                         task_id = std::get<0>(task);
                         task_index = std::get<1>(task);
                         num_total_tasks = std::get<2>(task);
+                        
+                        // Get the runnable outside the lock to minimize lock time
+                        if (task_info.find(task_id) != task_info.end()) {
+                            task_runnable = task_info[task_id].runnable;
+                        }
                     }
                 }
                 
-                // If we got a valid task, execute it
-                if (task_id > 0) {
-                    auto& task = task_info[task_id];
-                    
-                    // Execute the task
-                    task.runnable->runTask(task_index, num_total_tasks);
+                // If we got a valid task, execute it outside the lock
+                if (task_id > 0 && task_runnable != nullptr) {
+                    // Execute the task without holding the lock
+                    task_runnable->runTask(task_index, num_total_tasks);
                     
                     // Update task completion status
                     {
                         std::lock_guard<std::mutex> lock(queue_mutex);
+                        auto& task = task_info[task_id];
                         
                         // Decrement the counter of remaining tasks for this bulk launch
                         task.tasks_remaining--;
@@ -217,30 +222,49 @@ TaskSystemParallelThreadPoolSleeping::~TaskSystemParallelThreadPoolSleeping() {
     }
 }
 
+// Helper method to bulk enqueue tasks
+void TaskSystemParallelThreadPoolSleeping::bulkEnqueueTasks(TaskID task_id, int num_total_tasks) {
+    // Prepare tasks for enqueueing
+    std::vector<std::tuple<TaskID, int, int>> tasks_to_add;
+    tasks_to_add.reserve(num_total_tasks);
+    
+    for (int i = 0; i < num_total_tasks; i++) {
+        tasks_to_add.push_back(std::make_tuple(task_id, i, num_total_tasks));
+    }
+    
+    // Add tasks to queue under lock
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        for (const auto& task : tasks_to_add) {
+            ready_queue.push_back(task);
+        }
+    }
+    
+    // Notify workers only once after all tasks are added
+    cv_tasks_available.notify_all();
+}
+
 void TaskSystemParallelThreadPoolSleeping::checkAndEnqueueWaitingTasks(TaskID completed_task_id) {
-    // Find tasks that were waiting on this completed task
-    for (auto it = waiting_tasks.begin(); it != waiting_tasks.end(); ) {
-        TaskID waiting_task_id = it->first;
-        std::set<TaskID>& dependencies = it->second;
-        
-        // Remove the completed task from the dependencies
-        dependencies.erase(completed_task_id);
+    // Optimization: Use the direct dependency list from the completed task
+    auto& completed_task = task_info[completed_task_id];
+    
+    for (TaskID dependent_id : completed_task.dependent_tasks) {
+        auto& deps = waiting_tasks[dependent_id];
+        deps.erase(completed_task_id);
         
         // If all dependencies are satisfied, move tasks to the ready queue
-        if (dependencies.empty()) {
+        if (deps.empty()) {
             // This task has no more dependencies, add all its subtasks to the ready queue
-            auto& task = task_info[waiting_task_id];
+            auto& task = task_info[dependent_id];
             for (int i = 0; i < task.num_total_tasks; i++) {
-                ready_queue.push(std::make_tuple(waiting_task_id, i, task.num_total_tasks));
+                ready_queue.push_back(std::make_tuple(dependent_id, i, task.num_total_tasks));
             }
             
             // Remove this task from the waiting list
-            it = waiting_tasks.erase(it);
+            waiting_tasks.erase(dependent_id);
             
             // Notify worker threads that new tasks are available
             cv_tasks_available.notify_all();
-        } else {
-            ++it;
         }
     }
 }
@@ -259,8 +283,36 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
         return next_task_id++;
     }
     
-    // Lock the mutex to update shared data structures
-    std::unique_lock<std::mutex> lock(queue_mutex);
+    // Fast path for no dependencies
+    if (deps.empty()) {
+        TaskID new_task_id;
+        
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            new_task_id = next_task_id++;
+            
+            // Create task info
+            TaskInfo task;
+            task.runnable = runnable;
+            task.num_total_tasks = num_total_tasks;
+            task.tasks_remaining = num_total_tasks;
+            task.is_complete = false;
+            
+            // Add to task info map
+            task_info[new_task_id] = task;
+            
+            // Update total tasks counter
+            total_tasks_remaining += num_total_tasks;
+        }
+        
+        // Bulk enqueue tasks without holding the lock for too long
+        bulkEnqueueTasks(new_task_id, num_total_tasks);
+        
+        return new_task_id;
+    }
+    
+    // Regular path with dependency checking
+    std::lock_guard<std::mutex> lock(queue_mutex);
     
     // Get a new task ID
     TaskID new_task_id = next_task_id++;
@@ -280,37 +332,32 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
     
     // Check if this task has dependencies
     bool has_pending_deps = false;
+    std::set<TaskID> pending_deps;
     
-    if (!deps.empty()) {
-        std::set<TaskID> pending_deps;
-        
-        // Check each dependency
-        for (TaskID dep_id : deps) {
-            // Skip invalid dependencies
-            if (dep_id == 0 || task_info.find(dep_id) == task_info.end()) {
-                continue;
-            }
-            
-            // If the dependency is not complete, add it to pending dependencies
-            if (!task_info[dep_id].is_complete) {
-                pending_deps.insert(dep_id);
-                
-                // Add this task to the dependent_tasks list of the dependency
-                task_info[dep_id].dependent_tasks.insert(new_task_id);
-                has_pending_deps = true;
-            }
+    // Check each dependency
+    for (TaskID dep_id : deps) {
+        // Skip invalid dependencies
+        if (dep_id == 0 || task_info.find(dep_id) == task_info.end()) {
+            continue;
         }
         
-        // If there are pending dependencies, add to waiting tasks
-        if (has_pending_deps) {
-            waiting_tasks[new_task_id] = pending_deps;
+        // If the dependency is not complete, add it to pending dependencies
+        if (!task_info[dep_id].is_complete) {
+            pending_deps.insert(dep_id);
+            
+            // Add this task to the dependent_tasks list of the dependency
+            task_info[dep_id].dependent_tasks.push_back(new_task_id);
+            has_pending_deps = true;
         }
     }
     
-    // If no pending dependencies, add all tasks to ready queue
-    if (!has_pending_deps) {
+    // If there are pending dependencies, add to waiting tasks
+    if (has_pending_deps) {
+        waiting_tasks[new_task_id] = pending_deps;
+    } else {
+        // If no pending dependencies, add all tasks to ready queue
         for (int i = 0; i < num_total_tasks; i++) {
-            ready_queue.push(std::make_tuple(new_task_id, i, num_total_tasks));
+            ready_queue.push_back(std::make_tuple(new_task_id, i, num_total_tasks));
         }
         
         // Notify worker threads that new tasks are available
